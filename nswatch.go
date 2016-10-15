@@ -19,13 +19,24 @@ const (
 	CN_VAL_PROC = 0x1
 
 	// <linux/cn_proc.h>
+	PROC_CN_GET_FEATURES = 0
 	PROC_CN_MCAST_LISTEN = 1
 	PROC_CN_MCAST_IGNORE = 2
 
-	PROC_EVENT_FORK = 0x00000001 // fork() events
-	PROC_EVENT_EXEC = 0x00000002 // exec() events
-	PROC_EVENT_NM   = 0x00000400 // namespace events
-	PROC_EVENT_EXIT = 0x80000000 // exit() events
+	PROC_EVENT_NONE   = 0x00000000
+	PROC_EVENT_FORK   = 0x00000001
+	PROC_EVENT_EXEC   = 0x00000002
+	PROC_EVENT_UID    = 0x00000004
+	PROC_EVENT_GID    = 0x00000040
+	PROC_EVENT_SID    = 0x00000080
+	PROC_EVENT_PTRACE = 0x00000100
+	PROC_EVENT_COMM   = 0x00000200
+	PROC_EVENT_NS     = 0x00000400
+	/* "next" should be 0x00000800 */
+	/* "last" is the last process event: exit,
+	 * while "next to last" is coredumping event */
+	PROC_EVENT_COREDUMP = 0x40000000
+	PROC_EVENT_EXIT     = 0x80000000
 )
 
 var (
@@ -56,6 +67,21 @@ type procEventHeader struct {
 	Timestamp uint64
 }
 
+type namespaceEventHeader struct {
+	Timestamp   uint64
+	ProcessPid  uint32
+	ProcessTgid uint32
+	Reason      uint32
+	Count       uint32
+}
+
+type namespaceEventContent struct {
+	Type    uint32
+	Flags   uint32
+	OldInum uint64
+	Inum    uint64
+}
+
 // linux/cn_proc.h: struct proc_event.fork
 type forkProcEvent struct {
 	ParentPid  uint32
@@ -71,13 +97,18 @@ type execProcEvent struct {
 }
 
 // linux/cn_proc.h: struct proc_event.exec
-type nmProcEvent struct {
+type nsProcItem struct {
+	ItemType uint32
+	Flag     uint32
+	OldInum  uint64
+	Inum     uint64
+}
+type nsProcEvent struct {
 	ProcessPid  uint32
 	ProcessTgid uint32
-	NmType      uint32
-	NmReason    uint32
-	OldInum     uint64
-	Inum        uint64
+	Reason      uint32
+	Count       uint32
+	Items       [7]nsProcItem
 }
 
 // linux/cn_proc.h: struct proc_event.exit
@@ -94,9 +125,7 @@ type netlinkProcMessage struct {
 	Data   cnMsg
 }
 
-func subscribe(sock int, addr *syscall.SockaddrNetlink) {
-	var op uint32
-	op = PROC_CN_MCAST_LISTEN
+func subscribe(sock int, addr *syscall.SockaddrNetlink, op uint32) {
 	seq++
 
 	pr := &netlinkProcMessage{}
@@ -139,13 +168,13 @@ func receive(sock int) {
 		msgs, _ := syscall.ParseNetlinkMessage(buf[:nr])
 		for _, m := range msgs {
 			if m.Header.Type == syscall.NLMSG_DONE {
-				handleEvent(m.Data)
+				handleProcEvent(m.Data)
 			}
 		}
 	}
 }
 
-func handleEvent(data []byte) {
+func handleProcEvent(data []byte) {
 	buf := bytes.NewBuffer(data)
 	msg := &cnMsg{}
 	hdr := &procEventHeader{}
@@ -154,6 +183,9 @@ func handleEvent(data []byte) {
 	binary.Read(buf, byteOrder, hdr)
 
 	switch hdr.What {
+	case PROC_EVENT_NONE:
+		fmt.Printf("none: flags=%v\n", msg.Flags)
+
 	case PROC_EVENT_FORK:
 		event := &forkProcEvent{}
 		binary.Read(buf, byteOrder, event)
@@ -169,33 +201,53 @@ func handleEvent(data []byte) {
 
 		fmt.Printf("exec: pid=%v\n", pid)
 
-	case PROC_EVENT_NM:
-		event := &nmProcEvent{}
+	case PROC_EVENT_NS:
+		event := &nsProcEvent{}
 		binary.Read(buf, byteOrder, event)
 		pid := int(event.ProcessTgid)
-		nmType := int(event.NmType)
-		nmReason := int(event.NmReason)
-		oldInum := uint64(event.OldInum)
-		inum := uint64(event.Inum)
+		count := int(event.Count)
+		reason := int(event.Reason)
 
-		var typeStr string
-		switch nmType {
-		case syscall.CLONE_NEWPID:
-			typeStr = "pid"
-		case syscall.CLONE_NEWNS:
-			typeStr = "mnt"
-		case syscall.CLONE_NEWNET:
-			typeStr = "net"
-		case syscall.CLONE_NEWUTS:
-			typeStr = "uts"
-		case syscall.CLONE_NEWIPC:
-			typeStr = "ipc"
-		case syscall.CLONE_NEWUSER:
-			typeStr = "user"
+		var reasonStr string
+		switch reason {
+		case 1:
+			reasonStr = "clone"
+		case 2:
+			reasonStr = "setns"
+		case 3:
+			reasonStr = "unshare"
 		default:
-			typeStr = "unknown"
+			reasonStr = "unknown"
 		}
-		fmt.Printf("nm: pid=%v type=%v reason=%v old_inum=%v inum=%v\n", pid, typeStr, nmReason, oldInum, inum)
+
+		fmt.Printf("ns: pid=%v reason=%v count=%v\n", pid, reasonStr, count)
+
+		for i := 0; i < count; i++ {
+
+			itemType := uint64(event.Items[i].ItemType)
+			oldInum := uint64(event.Items[i].OldInum)
+			inum := uint64(event.Items[i].Inum)
+
+			var typeStr string
+			switch itemType {
+			case syscall.CLONE_NEWPID:
+				typeStr = "pid "
+			case syscall.CLONE_NEWNS:
+				typeStr = "mnt "
+			case syscall.CLONE_NEWNET:
+				typeStr = "net "
+			case syscall.CLONE_NEWUTS:
+				typeStr = "uts "
+			case syscall.CLONE_NEWIPC:
+				typeStr = "ipc "
+			case syscall.CLONE_NEWUSER:
+				typeStr = "user"
+			default:
+				typeStr = "unknown"
+			}
+
+			fmt.Printf("    type=%s %v -> %v\n", typeStr, oldInum, inum)
+		}
 
 	case PROC_EVENT_EXIT:
 		event := &exitProcEvent{}
@@ -203,6 +255,16 @@ func handleEvent(data []byte) {
 		pid := int(event.ProcessTgid)
 
 		fmt.Printf("exit: pid=%v\n", pid)
+
+	case PROC_EVENT_UID:
+	case PROC_EVENT_GID:
+	case PROC_EVENT_SID:
+	case PROC_EVENT_PTRACE:
+	case PROC_EVENT_COMM:
+	case PROC_EVENT_COREDUMP:
+
+	default:
+		fmt.Printf("???: what=%x\n", hdr.What)
 	}
 }
 
@@ -229,7 +291,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	subscribe(sock, addr)
+	if len(os.Args) == 2 {
+		switch os.Args[1] {
+		case "sub":
+			subscribe(sock, addr, PROC_CN_MCAST_LISTEN)
+		case "unsub":
+			subscribe(sock, addr, PROC_CN_MCAST_IGNORE)
+		case "features":
+			subscribe(sock, addr, PROC_CN_GET_FEATURES)
+		}
+	}
 
 	receive(sock)
 }
